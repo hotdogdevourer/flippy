@@ -653,7 +653,11 @@ static int fat12_add_directory_recursive(FILE *img_fp, const floppy_params_t *pa
 
     while ((de = readdir(dir)) != NULL) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        snprintf(full_local, sizeof(full_local), "%s/%s", local_path, de->d_name);
+        int written = snprintf(full_local, sizeof(full_local), "%s/%s", local_path, de->d_name);
+        if (written >= (int)sizeof(full_local)) {
+            fprintf(stderr, "Path too long, skipping: %s/%s\n", local_path, de->d_name);
+            continue;
+        }
         STAT_STRUCT st;
         if (STAT(full_local, &st) != 0) continue;
 
@@ -677,7 +681,7 @@ static int fat12_add_directory_recursive(FILE *img_fp, const floppy_params_t *pa
                 }
                 free(parent_buf);
                 if (subdir_cluster != 0xFFFF) {
-                    char sub_dest[256];
+                    char sub_dest[PATH_MAX];
                     if (dest_path && *dest_path)
                         snprintf(sub_dest, sizeof(sub_dest), "%s/%s", dest_path, de->d_name);
                     else
