@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 :: Configuration
-set "EXE=main.exe"
+set "EXE=main32.exe"
 set "TEST_DIR=testdata"
 set "PASS_COUNT=0"
 set "FAIL_COUNT=0"
@@ -47,7 +47,7 @@ echo.
 exit /b 0
 
 :init
-call :log_header "Flippy - Automated Test Suite"
+call :log_header "Flippy - Manual Test Suite for i686"
 echo Date: %date% Time: %time%
 echo.
 
