@@ -103,7 +103,7 @@ typedef struct {
 
 static DIR *opendir(const char *name) {
     DIR *dir;
-    char pattern[PATH_MAX];
+    char pattern[PATH_MAX + 3];
     snprintf(pattern, sizeof(pattern), "%s\\*", name);
     dir = (DIR*)malloc(sizeof(DIR));
     if (!dir) return NULL;
@@ -133,7 +133,7 @@ static struct dirent *readdir(DIR *dir) {
 static void rewinddir(DIR *dir) {
     if (!dir) return;
     FindClose(dir->hFind);
-    char pattern[PATH_MAX];
+    char pattern[PATH_MAX+3];
     snprintf(pattern, sizeof(pattern), "%s\\*", dir->dirname);
     dir->hFind = FindFirstFileA(pattern, &dir->findData);
     dir->first = 1;
@@ -681,7 +681,7 @@ static int fat12_add_directory_recursive(FILE *img_fp, const floppy_params_t *pa
                 }
                 free(parent_buf);
                 if (subdir_cluster != 0xFFFF) {
-                    char sub_dest[PATH_MAX];
+                    char sub_dest[PATH_MAX*2];
                     if (dest_path && *dest_path)
                         snprintf(sub_dest, sizeof(sub_dest), "%s/%s", dest_path, de->d_name);
                     else
@@ -1843,182 +1843,348 @@ static int iso_extract_directory(const char *iso_path, const char *src_path,
 }
 
 
-static void iso_zero_blocks(FILE *fp, uint32_t extent, uint32_t size) {
-    uint8_t zero[ISO_BLOCK_SIZE];
-    uint32_t blocks, i;
-    memset(zero, 0, ISO_BLOCK_SIZE);
-    blocks = (size + ISO_BLOCK_SIZE - 1) / ISO_BLOCK_SIZE;
-    for (i = 0; i < blocks; i++) {
-        fseek(fp, (extent + i) * ISO_BLOCK_SIZE, SEEK_SET);
-        fwrite(zero, 1, ISO_BLOCK_SIZE, fp);
-    }
+
+#define ISO_NODE_FILE 0
+#define ISO_NODE_DIR  1
+
+typedef struct iso_node_t {
+    int      type;                                                         
+    uint32_t old_extent;                                                   
+    uint32_t old_size;                                                     
+    uint32_t new_extent;                                                   
+    uint32_t new_blocks;                                                   
+    uint8_t *dir_buf;
+    uint32_t dir_buf_size;                                                 
+    int      is_root;
+} iso_node_t;
+
+typedef struct {
+    iso_node_t *nodes;
+    size_t      count;
+    size_t      cap;
+} iso_node_list_t;
+
+static void iso_nodelist_init(iso_node_list_t *l) {
+    l->nodes = NULL; l->count = 0; l->cap = 0;
 }
 
-static void iso_zero_tree(FILE *fp, uint32_t extent, uint32_t size) {
-    uint8_t *buf = (uint8_t*)malloc(size);
-    uint8_t *rec_ptr, *end;
-    if (!buf) return;
-    fseek(fp, extent * ISO_BLOCK_SIZE, SEEK_SET);
-    fread(buf, 1, size, fp);
+static iso_node_t* iso_nodelist_add(iso_node_list_t *l) {
+    if (l->count == l->cap) {
+        size_t newcap = l->cap ? l->cap * 2 : 64;
+        iso_node_t *tmp = (iso_node_t*)realloc(l->nodes,
+                                                newcap * sizeof(iso_node_t));
+        if (!tmp) return NULL;
+        l->nodes = tmp; l->cap = newcap;
+    }
+    memset(&l->nodes[l->count], 0, sizeof(iso_node_t));
+    return &l->nodes[l->count++];
+}
 
-    end = buf + size;
-    rec_ptr = buf;
+static void iso_nodelist_free(iso_node_list_t *l) {
+    size_t i;
+    for (i = 0; i < l->count; i++)
+        if (l->nodes[i].dir_buf) free(l->nodes[i].dir_buf);
+    free(l->nodes);
+    iso_nodelist_init(l);
+}
+
+typedef struct {
+    char **paths;
+    size_t count;
+} iso_delset_t;
+
+static int iso_delset_contains(const iso_delset_t *ds, const char *path) {
+    size_t i;
+    for (i = 0; i < ds->count; i++)
+        if (strcasecmp(ds->paths[i], path) == 0) return 1;
+    return 0;
+}
+
+static int iso_walk_tree(FILE *fp,
+                         uint32_t old_extent, uint32_t old_size,
+                         const char *abs_prefix,
+                         const iso_delset_t *delset,
+                         iso_node_list_t *nl,
+                         int is_root) {
+    uint8_t *dir_src;
+    uint8_t *rec_ptr, *end;
+    uint32_t dir_alloc = ((old_size + ISO_BLOCK_SIZE - 1) / ISO_BLOCK_SIZE)
+                         * ISO_BLOCK_SIZE;
+    uint8_t *dir_new   = (uint8_t*)calloc(1, dir_alloc);
+    uint8_t *dir_ptr   = dir_new;
+
+    iso_node_t *dir_node = iso_nodelist_add(nl);
+    if (!dir_node || !dir_new) { free(dir_new); return -1; }
+    int dir_idx = (int)(dir_node - nl->nodes);
+    dir_node->type        = ISO_NODE_DIR;
+    dir_node->old_extent  = old_extent;
+    dir_node->old_size    = old_size;
+    dir_node->new_blocks  = dir_alloc / ISO_BLOCK_SIZE;
+    dir_node->is_root     = is_root;
+
+    dir_src = (uint8_t*)malloc(old_size);
+    if (!dir_src) { free(dir_new); return -1; }
+    fseek(fp, old_extent * ISO_BLOCK_SIZE, SEEK_SET);
+    fread(dir_src, 1, old_size, fp);
+
+    end     = dir_src + old_size;
+    rec_ptr = dir_src;
     while (rec_ptr < end) {
         iso_dir_rec_t *rec = (iso_dir_rec_t*)rec_ptr;
         if (rec->record_len == 0) break;
-        if (rec->name_len > 0 && rec->name[0] != 0 && rec->name[0] != 1) {
-            uint32_t child_extent = READ_ISO_32LE(rec->extent_loc);
-            uint32_t child_size   = READ_ISO_32LE(rec->data_len);
-            if (rec->flags & 0x02)
-                iso_zero_tree(fp, child_extent, child_size);               
-            iso_zero_blocks(fp, child_extent, child_size);
+
+        if (rec->name_len == 1 && (rec->name[0] == 0 || rec->name[0] == 1)) {
+            memcpy(dir_ptr, rec, rec->record_len);
+            dir_ptr += rec->record_len;
+            rec_ptr += rec->record_len;
+            continue;
+        }
+
+        char abs_child[PATH_MAX];
+        char entry_name[256];
+        memcpy(entry_name, rec->name, rec->name_len);
+        entry_name[rec->name_len] = '\0';
+        if (abs_prefix[0])
+            snprintf(abs_child, sizeof(abs_child), "%s/%s", abs_prefix, entry_name);
+        else
+            snprintf(abs_child, sizeof(abs_child), "%s", entry_name);
+
+        if (iso_delset_contains(delset, abs_child)) {
+            rec_ptr += rec->record_len;
+            continue;
+        }
+
+        if (rec->flags & 0x02) {
+            uint32_t child_old_extent = READ_ISO_32LE(rec->extent_loc);
+            uint32_t child_old_size   = READ_ISO_32LE(rec->data_len);
+            int child_idx = iso_walk_tree(fp, child_old_extent, child_old_size,
+                                          abs_child, delset, nl, 0);
+            if (child_idx < 0) { free(dir_src); free(dir_new); return -1; }
+
+            dir_node = &nl->nodes[dir_idx];
+
+            memcpy(dir_ptr, rec, rec->record_len);
+            iso_dir_rec_t *new_rec = (iso_dir_rec_t*)dir_ptr;
+            WRITE_ISO_32LE(new_rec->extent_loc, (uint32_t)child_idx);
+            dir_ptr += rec->record_len;
+        } else {
+            iso_node_t *fn = iso_nodelist_add(nl);
+            if (!fn) { free(dir_src); free(dir_new); return -1; }
+            dir_node = &nl->nodes[dir_idx];
+
+            int file_idx = (int)(fn - nl->nodes);
+            fn->type       = ISO_NODE_FILE;
+            fn->old_extent = READ_ISO_32LE(rec->extent_loc);
+            fn->old_size   = READ_ISO_32LE(rec->data_len);
+            fn->new_blocks = (fn->old_size + ISO_BLOCK_SIZE - 1) / ISO_BLOCK_SIZE;
+
+            memcpy(dir_ptr, rec, rec->record_len);
+            iso_dir_rec_t *new_rec = (iso_dir_rec_t*)dir_ptr;
+            WRITE_ISO_32LE(new_rec->extent_loc, (uint32_t)file_idx);
+            dir_ptr += rec->record_len;
         }
         rec_ptr += rec->record_len;
     }
-    free(buf);
+    free(dir_src);
+
+    dir_node = &nl->nodes[dir_idx];                                        
+    dir_node->dir_buf      = dir_new;
+    dir_node->dir_buf_size = dir_alloc;
+    return dir_idx;
 }
 
-static int iso_remove_dir_entry(FILE *fp, uint32_t dir_extent, uint32_t dir_size,
-                                const char *name,
-                                uint32_t *out_extent, uint32_t *out_size,
-                                uint8_t  *out_flags) {
-    uint8_t *buf = (uint8_t*)malloc(dir_size);
-    uint8_t *rec_ptr, *end;
-    int found = 0;
-    if (!buf) return 0;
-    fseek(fp, dir_extent * ISO_BLOCK_SIZE, SEEK_SET);
-    fread(buf, 1, dir_size, fp);
+static uint32_t iso_assign_extents(iso_node_list_t *nl, uint32_t start_extent) {
+    uint32_t cur = start_extent;
+    size_t i;
+    for (i = 0; i < nl->count; i++) {
+        nl->nodes[i].new_extent = cur;
+        cur += nl->nodes[i].new_blocks;
+    }
+    for (i = 0; i < nl->count; i++) {
+        iso_node_t *node = &nl->nodes[i];
+        if (node->type != ISO_NODE_DIR) continue;
 
-    end = buf + dir_size;
-    rec_ptr = buf;
-    while (rec_ptr < end) {
-        iso_dir_rec_t *rec = (iso_dir_rec_t*)rec_ptr;
-        if (rec->record_len == 0) break;
-        if (rec->name_len > 0 && rec->name[0] != 0 && rec->name[0] != 1) {
-            char rec_name[256];
-            memcpy(rec_name, rec->name, rec->name_len);
-            rec_name[rec->name_len] = '\0';
-            if (strcasecmp(rec_name, name) == 0) {
-                *out_extent = READ_ISO_32LE(rec->extent_loc);
-                *out_size   = READ_ISO_32LE(rec->data_len);
-                *out_flags  = rec->flags;
-                rec->record_len = 0;
-                found = 1;
-                break;
+        uint8_t *ptr = node->dir_buf;
+        uint8_t *end = ptr + node->dir_buf_size;
+        while (ptr < end) {
+            iso_dir_rec_t *rec = (iso_dir_rec_t*)ptr;
+            if (rec->record_len == 0) break;
+            if (rec->name_len == 1 && rec->name[0] == 0) {
+                WRITE_ISO_32LE(rec->extent_loc, node->new_extent);
+                WRITE_ISO_32LE(rec->data_len,   node->new_blocks * ISO_BLOCK_SIZE);
+            } else if (rec->name_len == 1 && rec->name[0] == 1) {
+                uint32_t old_parent_extent = READ_ISO_32LE(rec->extent_loc);
+                uint32_t new_parent_extent = node->new_extent;                    
+                size_t j;
+                for (j = 0; j < nl->count; j++) {
+                    if (nl->nodes[j].type == ISO_NODE_DIR &&
+                        nl->nodes[j].old_extent == old_parent_extent) {
+                        new_parent_extent = nl->nodes[j].new_extent;
+                        break;
+                    }
+                }
+                WRITE_ISO_32LE(rec->extent_loc, new_parent_extent);
+            } else {
+                uint32_t child_idx = READ_ISO_32LE(rec->extent_loc);
+                if (child_idx < (uint32_t)nl->count) {
+                    WRITE_ISO_32LE(rec->extent_loc, nl->nodes[child_idx].new_extent);
+                    if (rec->flags & 0x02) {
+                        WRITE_ISO_32LE(rec->data_len,
+                            nl->nodes[child_idx].new_blocks * ISO_BLOCK_SIZE);
+                    }
+                }
+            }
+            ptr += rec->record_len;
+        }
+    }
+    return cur;                                                   
+}
+
+static int iso_write_repacked(FILE *fp, const iso_node_list_t *nl) {
+    size_t i;
+    uint8_t *buf = (uint8_t*)malloc(ISO_BLOCK_SIZE);
+    if (!buf) return -1;
+
+    for (i = 0; i < nl->count; i++) {
+        const iso_node_t *node = &nl->nodes[i];
+        uint32_t b;
+
+        if (node->type == ISO_NODE_DIR) {
+            fseek(fp, node->new_extent * ISO_BLOCK_SIZE, SEEK_SET);
+            fwrite(node->dir_buf, 1, node->dir_buf_size, fp);
+        } else {
+            for (b = 0; b < node->new_blocks; b++) {
+                memset(buf, 0, ISO_BLOCK_SIZE);
+                fseek(fp, (node->old_extent + b) * ISO_BLOCK_SIZE, SEEK_SET);
+                fread(buf, 1, ISO_BLOCK_SIZE, fp);
+                fseek(fp, (node->new_extent + b) * ISO_BLOCK_SIZE, SEEK_SET);
+                fwrite(buf, 1, ISO_BLOCK_SIZE, fp);
             }
         }
-        rec_ptr += rec->record_len;
-    }
-
-    if (found) {
-        fseek(fp, dir_extent * ISO_BLOCK_SIZE, SEEK_SET);
-        fwrite(buf, 1, dir_size, fp);
     }
     free(buf);
-    return found;
+    return 0;
 }
 
-static int iso_open_pvd(const char *iso_path, FILE **fp_out,
-                        uint32_t *root_extent, uint32_t *root_size) {
-    uint8_t block[ISO_BLOCK_SIZE];
-    FILE *fp = fopen(iso_path, "r+b");
-    if (!fp) { perror("fopen"); return -1; }
-    fseek(fp, 16 * ISO_BLOCK_SIZE, SEEK_SET);
-    fread(block, 1, ISO_BLOCK_SIZE, fp);
-    iso_pvd_t *pvd = (iso_pvd_t*)block;
-    if (pvd->type != 1) {
+static int iso_truncate(const char *path, long size) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    SetFilePointer(h, size, NULL, FILE_BEGIN);
+    SetEndOfFile(h);
+    CloseHandle(h);
+    return 0;
+#else
+    return truncate(path, (off_t)size);
+#endif
+}
+
+static int iso_repack_delete(const char *iso_path, const iso_delset_t *delset,
+                             int delete_type) {
+    FILE *fp_r = fopen(iso_path, "rb");
+    if (!fp_r) { perror("fopen"); return -1; }
+
+    uint8_t pvd_block[ISO_BLOCK_SIZE];
+    fseek(fp_r, 16 * ISO_BLOCK_SIZE, SEEK_SET);
+    fread(pvd_block, 1, ISO_BLOCK_SIZE, fp_r);
+    iso_pvd_t *pvd_check = (iso_pvd_t*)pvd_block;
+    if (pvd_check->type != 1) {
         fprintf(stderr, "Invalid ISO image.\n");
-        fclose(fp); return -1;
+        fclose(fp_r); return -1;
     }
-    iso_dir_rec_t *root_rec = (iso_dir_rec_t*)(pvd->data + 156);
-    *root_extent = READ_ISO_32LE(root_rec->extent_loc);
-    *root_size   = READ_ISO_32LE(root_rec->data_len);
-    *fp_out = fp;
+    iso_dir_rec_t *root_check = (iso_dir_rec_t*)(pvd_check->data + 156);
+    uint32_t root_extent = READ_ISO_32LE(root_check->extent_loc);
+    uint32_t root_size   = READ_ISO_32LE(root_check->data_len);
+
+    size_t di;
+    for (di = 0; di < delset->count; di++) {
+        uint32_t e, s; uint8_t fl;
+        if (!iso_find_path(fp_r, root_extent, root_size,
+                           delset->paths[di], &e, &s, &fl)) {
+            fprintf(stderr, "'%s' not found in ISO.\n", delset->paths[di]);
+            fclose(fp_r); return -1;
+        }
+        if (delete_type == 0 && (fl & 0x02)) {
+            fprintf(stderr, "'%s' is a directory, use delete-dir-iso.\n",
+                    delset->paths[di]);
+            fclose(fp_r); return -1;
+        }
+        if (delete_type == 1 && !(fl & 0x02)) {
+            fprintf(stderr, "'%s' is a file, use delete-iso.\n",
+                    delset->paths[di]);
+            fclose(fp_r); return -1;
+        }
+    }
+
+    iso_node_list_t nl;
+    iso_nodelist_init(&nl);
+    int root_idx = iso_walk_tree(fp_r, root_extent, root_size, "",
+                                 delset, &nl, 1);
+    fclose(fp_r);
+
+    if (root_idx < 0) {
+        fprintf(stderr, "Failed to walk ISO tree.\n");
+        iso_nodelist_free(&nl);
+        return -1;
+    }
+
+    uint32_t new_total = iso_assign_extents(&nl, ISO_SYSTEM_AREA + 2);
+
+    FILE *fp_w = fopen(iso_path, "r+b");
+    if (!fp_w) { perror("fopen r+b"); iso_nodelist_free(&nl); return -1; }
+
+    if (iso_write_repacked(fp_w, &nl) != 0) {
+        fprintf(stderr, "Write failed during repack.\n");
+        fclose(fp_w); iso_nodelist_free(&nl); return -1;
+    }
+
+    fseek(fp_w, 16 * ISO_BLOCK_SIZE, SEEK_SET);
+    fread(pvd_block, 1, ISO_BLOCK_SIZE, fp_w);
+    iso_pvd_t *pvd_w = (iso_pvd_t*)pvd_block;
+    uint8_t *pd = pvd_w->data;
+
+    WRITE_ISO_32LE(pd + 80, new_total);
+
+    iso_dir_rec_t *new_root_rec = (iso_dir_rec_t*)(pd + 156);
+    WRITE_ISO_32LE(new_root_rec->extent_loc, nl.nodes[root_idx].new_extent);
+    WRITE_ISO_32LE(new_root_rec->data_len,
+                   nl.nodes[root_idx].new_blocks * ISO_BLOCK_SIZE);
+
+    fseek(fp_w, 16 * ISO_BLOCK_SIZE, SEEK_SET);
+    fwrite(pvd_block, 1, ISO_BLOCK_SIZE, fp_w);
+    fclose(fp_w);
+
+    iso_nodelist_free(&nl);
+
+    long new_size = (long)new_total * ISO_BLOCK_SIZE;
+    if (iso_truncate(iso_path, new_size) != 0)
+        fprintf(stderr, "Warning: could not truncate ISO (image still valid).\n");
+
     return 0;
 }
 
 static int iso_delete_file(const char *iso_path, const char *path) {
-    FILE *fp;
-    uint32_t root_extent, root_size;
-    if (iso_open_pvd(iso_path, &fp, &root_extent, &root_size) != 0) return -1;
-
-    char parent_path[PATH_MAX];
-    const char *sep = strrchr(path, '/');
-    const char *sep2 = strrchr(path, '\\');
-    if (sep2 > sep) sep = sep2;
-    const char *name = sep ? sep + 1 : path;
-
-    uint32_t dir_extent = root_extent, dir_size = root_size;
-    if (sep) {
-        size_t len = (size_t)(sep - path);
-        memcpy(parent_path, path, len); parent_path[len] = '\0';
-        uint8_t flags;
-        if (!iso_find_path(fp, root_extent, root_size, parent_path,
-                           &dir_extent, &dir_size, &flags) || !(flags & 0x02)) {
-            fprintf(stderr, "Parent directory not found.\n");
-            fclose(fp); return -1;
-        }
-    }
-
-    uint32_t file_extent, file_size;
-    uint8_t flags;
-    if (!iso_remove_dir_entry(fp, dir_extent, dir_size, name,
-                              &file_extent, &file_size, &flags)) {
-        fprintf(stderr, "File '%s' not found.\n", name);
-        fclose(fp); return -1;
-    }
-    if (flags & 0x02) {
-        fprintf(stderr, "'%s' is a directory, use delete-dir-iso instead.\n", path);
-        fclose(fp); return -1;
-    }
-    iso_zero_blocks(fp, file_extent, file_size);
-    fclose(fp);
-    printf("Deleted '%s' from ISO.\n", path);
-    return 0;
+    iso_delset_t ds;
+    ds.count = 1;
+    ds.paths = (char**)&path;
+    int r = iso_repack_delete(iso_path, &ds, 0);
+    if (r == 0) printf("Deleted '%s' and repacked ISO.\n", path);
+    return r;
 }
 
 static int iso_delete_directory(const char *iso_path, const char *path) {
-    FILE *fp;
-    uint32_t root_extent, root_size;
-    if (iso_open_pvd(iso_path, &fp, &root_extent, &root_size) != 0) return -1;
-
-    char parent_path[PATH_MAX];
-    const char *sep = strrchr(path, '/');
-    const char *sep2 = strrchr(path, '\\');
-    if (sep2 > sep) sep = sep2;
-    const char *name = sep ? sep + 1 : path;
-
-    uint32_t dir_extent = root_extent, dir_size = root_size;
-    if (sep) {
-        size_t len = (size_t)(sep - path);
-        memcpy(parent_path, path, len); parent_path[len] = '\0';
-        uint8_t flags;
-        if (!iso_find_path(fp, root_extent, root_size, parent_path,
-                           &dir_extent, &dir_size, &flags) || !(flags & 0x02)) {
-            fprintf(stderr, "Parent directory not found.\n");
-            fclose(fp); return -1;
-        }
-    }
-
-    uint32_t target_extent, target_size;
-    uint8_t flags;
-    if (!iso_remove_dir_entry(fp, dir_extent, dir_size, name,
-                              &target_extent, &target_size, &flags)) {
-        fprintf(stderr, "Directory '%s' not found.\n", name);
-        fclose(fp); return -1;
-    }
-    if (!(flags & 0x02)) {
-        fprintf(stderr, "'%s' is a file, use delete-iso instead.\n", path);
-        fclose(fp); return -1;
-    }
-    iso_zero_tree(fp, target_extent, target_size);
-    iso_zero_blocks(fp, target_extent, target_size);
-    fclose(fp);
-    printf("Deleted directory '%s' from ISO.\n", path);
-    return 0;
+    iso_delset_t ds;
+    ds.count = 1;
+    ds.paths = (char**)&path;
+    int r = iso_repack_delete(iso_path, &ds, 1);
+    if (r == 0) printf("Deleted directory '%s' and repacked ISO.\n", path);
+    return r;
 }
 
+
 static void print_usage(const char *prog) {
+    printf("Flippy - A simple CLI tool to manage floppy discs and Level 1 ISO 9660 CD/DVDs\n");
     printf("Usage: %s <command> [options]\n", prog);
     printf("FAT12 Floppy Commands:\n");
     printf("  create-fd <image> [160|180|320|360|720|1440|2880]  Create FAT12 floppy\n");
