@@ -82,7 +82,7 @@ Usage: flippy <command> [options]
     Extract a directory from the ISO.
 
 *   `delete-iso <image.iso> <path>`
-    Delete a file from the ISO. Note: This zeros out the data but does not shrink the ISO file size.
+    Delete a file from the ISO.
 
 *   `delete-dir-iso <image.iso> <path>`
     Delete a directory recursively from the ISO.
